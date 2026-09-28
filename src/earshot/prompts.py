@@ -61,8 +61,13 @@ STARTER_BOOL_QUESTIONS: list[dict] = [
     },
     {
         "id": "angry",
-        # Tuning pass winner — variant scored 19/21 vs original 18/21.
-        "text": "Is the speaker shouting or speaking with a raised voice?",
+        # Reverted to original Stage 2 wording after the tuning pass:
+        # angry_v2 ("shouting or speaking with a raised voice") scored 19/21
+        # but flipped the miss type to FN and caught 0/2 angry clips. The
+        # original wording caught 2/2 loud clips with 3 FPs (clap_1,
+        # stop_1, no_stop_1); Stage 7 calibration handles those via a
+        # per-question threshold.
+        "text": "Does the speaker sound angry or stressed?",
         "manifest_col": "angry",
     },
     {

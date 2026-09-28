@@ -30,6 +30,8 @@ clips/labels.csv
 bench/results.csv
 bench/latency.png
 bench/*.png
+*.out
+*.log
 
 # Model caches (downloaded by HF transformers)
 models/
