@@ -10,6 +10,11 @@ For each question:
 
 The model is loaded lazily on first call (cached at module level so a loop
 over many clips doesn't reload it).
+
+Stage 2.5 (pre-Stage 3 tuning pass) added signal-derived questions. A
+question with `source="signal"` skips the model and is answered from the raw
+audio (RMS check for `silent`). All other questions go to the model as
+before.
 """
 from __future__ import annotations
 
@@ -21,7 +26,11 @@ import numpy as np
 import torch
 
 from .model import load_model
-from .prompts import SYSTEM_MESSAGE, QUESTION_TEMPLATE
+from .prompts import (
+    QUESTION_TEMPLATE,
+    SIGNAL_SILENT_RMS_THRESHOLD,
+    SYSTEM_MESSAGE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +81,52 @@ def p_yes_from_logits(
 
 
 # ---------------------------------------------------------------------------
-# Single-question scoring
+# Result type — shared by signal and model scorers
+# ---------------------------------------------------------------------------
+
+# A ScoreResult is what every question reduces to, regardless of source. The
+# fields are kept as a plain dict (not a dataclass) until Stage 4 turns them
+# into a real typed schema. The keys here are stable; Stage 4 should not
+# rename them without a migration.
+#
+#   id      — question id (matches the input dict's "id")
+#   text    — question text (matches the input dict's "text")
+#   prob    — P(Yes), float in [0, 1]
+#   answer  — "Yes" if prob >= 0.5 else "No"
+#   source  — "model" or "signal" (the producer of `prob`)
+#
+def score_result(qid: str, text: str, prob: float, source: str) -> dict:
+    return {
+        "id": qid,
+        "text": text,
+        "prob": prob,
+        "answer": "Yes" if prob >= 0.5 else "No",
+        "source": source,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Signal-derived scoring (no model)
+# ---------------------------------------------------------------------------
+
+def rms(audio: np.ndarray) -> float:
+    """Root-mean-square amplitude of a 1-D float audio buffer."""
+    return float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+
+
+def score_signal_silent(audio: np.ndarray, qid: str = "silent", text: str = "Is the room silent?") -> dict:
+    """Score `silent` from the audio RMS.
+
+    Threshold chosen in prompts.py from the manifest data. Returns a
+    ScoreResult with prob = 1.0 for Yes (room is silent) or 0.0 for No.
+    """
+    r = rms(audio)
+    is_silent = r < SIGNAL_SILENT_RMS_THRESHOLD
+    return score_result(qid, text, prob=1.0 if is_silent else 0.0, source="signal")
+
+
+# ---------------------------------------------------------------------------
+# Single-question scoring (model)
 # ---------------------------------------------------------------------------
 
 def score_one(
@@ -144,21 +198,21 @@ def _ensure_loaded():
 
 def score_sequential(
     audio: np.ndarray,
-    questions: Iterable[dict] | Iterable[tuple[str, str]],
-) -> dict[str, float]:
+    questions: Iterable[dict],
+) -> dict[str, dict]:
     """Score each question against `audio` sequentially.
 
-    Args:
-        audio: 1-D float32 numpy array at 16 kHz mono. The model will truncate
-            the feature extractor to the real length (no 30-s padding).
-        questions: either dicts (must have "id" and "text") or (id, text) pairs.
+    Each question dict may carry:
+        id       — required, returned as the result key
+        text     — required, the natural-language question
+        source   — optional, "model" (default) or "signal". Only "signal"
+                   is recognised for the `silent` id, which is answered
+                   via score_signal_silent() with no model call.
+        manifest_col — optional, used by eval scripts
 
     Returns:
-        dict mapping question id to P(Yes), in float. Call order does not
-        affect the result, but Python insertion order is preserved.
-
-    The model is loaded on the first call and reused on subsequent calls
-    (cheaper when scoring the same model against many clips).
+        dict mapping question id to ScoreResult dict (see module docstring
+        for the field set). Signal and model questions are mixed freely.
     """
     cache = _ensure_loaded()
     processor = cache["processor"]
@@ -167,16 +221,23 @@ def score_sequential(
     yes_ids = cache["yes_ids"]
     no_ids = cache["no_ids"]
 
-    out: dict[str, float] = {}
+    out: dict[str, dict] = {}
     n_samples = int(audio.shape[-1]) if hasattr(audio, "shape") else len(audio)
     for q in questions:
-        if isinstance(q, dict):
-            qid = q["id"]
-            text = q["text"]
+        qid = q["id"]
+        text = q["text"]
+        source = q.get("source", "model")
+        if source == "signal":
+            # Currently the only signal-derived question is `silent`. Add more
+            # here as the typed schema grows in Stage 4.
+            if qid == "silent":
+                out[qid] = score_signal_silent(audio, qid=qid, text=text)
+            else:
+                raise ValueError(f"unknown signal question id: {qid!r}")
         else:
-            qid, text = q
-        out[qid] = score_one(
-            processor, model, device, audio, text,
-            yes_ids=yes_ids, no_ids=no_ids, n_samples=n_samples,
-        )
+            prob = score_one(
+                processor, model, device, audio, text,
+                yes_ids=yes_ids, no_ids=no_ids, n_samples=n_samples,
+            )
+            out[qid] = score_result(qid, text, prob, source="model")
     return out
