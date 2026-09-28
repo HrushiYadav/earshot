@@ -4,9 +4,19 @@ Loads Qwen2.5-Omni-3B (thinker-only) in float16 with eager attention.
 Follows the AGENTS.md recipe: load to CPU first, then `.to("mps")` —
 `device_map={"": "mps"}` triggers a SIGSEGV in `copy_cast_kernel_mps` on
 this PyTorch/torchvision/MPS combo.
+
+The Qwen2.5-Omni checkpoint ships with `talker.*` and
+`token2wav/code2wav_*` weights that the thinker-only class doesn't load —
+transformers prints a long `UNEXPECTED` key report and a handful of
+`[transformers] Model config: ... must be ... within the vocabulary`
+warnings on every load. These are noisy and add nothing for our use
+case, so we drop the transformers logger to ERROR just for the duration
+of `from_pretrained`. Real errors (network failures, missing files,
+genuine config issues) still surface because they come through ERROR.
 """
 from __future__ import annotations
 
+import logging
 import torch
 
 
@@ -39,14 +49,26 @@ def load_model():
         AutoProcessor,
     )
 
-    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-    model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
-        MODEL_ID,
-        dtype=torch.float16,
-        attn_implementation="eager",
-        low_cpu_mem_usage=True,
-        device_map=None,  # CPU-then-move, see module docstring.
-    )
+    # Silence the `UNEXPECTED` load-report and vocab-bound config warnings
+    # that the thinker-only class triggers on Qwen2.5-Omni. We only muffle
+    # transformers' own logger; real errors still surface because they go
+    # through ERROR level. Restored on exit so other parts of the process
+    # aren't affected.
+    tf_logger = logging.getLogger("transformers")
+    prev_level = tf_logger.getEffectiveLevel()
+    tf_logger.setLevel(logging.ERROR)
+    try:
+        processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+        model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+            MODEL_ID,
+            dtype=torch.float16,
+            attn_implementation="eager",
+            low_cpu_mem_usage=True,
+            device_map=None,  # CPU-then-move, see module docstring.
+        )
+    finally:
+        tf_logger.setLevel(prev_level)
+
     model.eval()
 
     device = pick_device()
