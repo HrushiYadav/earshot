@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+.eggs/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Project — private (not published) and audio/test artifacts
+private/
+AGENTS.md
+clips/
+bench/
+*.wav
+*.m4a
+*.aiff
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Project — test outputs and labels
+clips/labels.csv
+bench/results.csv
+bench/latency.png
+bench/*.png
+
+# Model caches (downloaded by HF transformers)
+models/
+.cache/
+hf_cache/
+
+# Editor / IDE
+.vscode/
+.idea/

@@ -1,0 +1,46 @@
+[project]
+name = "earshot"
+version = "0.1.0"
+description = "Local voice decision engine: answers typed yes/no or multiple-choice questions about the last few seconds of mic audio, fully offline on Apple Silicon."
+requires-python = ">=3.11"
+readme = "README.md"
+authors = [{ name = "@Hrushi" }]
+dependencies = [
+    # Audio I/O
+    "sounddevice>=0.4.7",
+    "numpy>=1.26",
+    # HF transformers + accelerate + PyTorch (MPS backend on Apple Silicon)
+    "torch>=2.3",
+    "transformers>=4.45",
+    "accelerate>=0.34",
+    "sentencepiece>=0.2",
+    "protobuf>=5.27",
+    # Schema & YAML
+    "pydantic>=2.7",
+    "PyYAML>=6.0",
+    # Live UI
+    "rich>=13.7",
+    # Audio file I/O for tests/clips
+    "soundfile>=0.12",
+    # Needed by Qwen2.5-Omni's AutoProcessor even when only audio is used.
+    "torchvision>=0.18",
+    "Pillow>=10.3",
+    "hf-transfer>=0.1.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "matplotlib>=3.9",
+]
+
+[project.scripts]
+earshot-live = "earshot.live:main"
+earshot-record = "earshot.record_clips:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/earshot"]
