@@ -1,0 +1,4 @@
+n_questions,sequential_s_median,batched_s_median,speedup_x,clip_label,clip_seconds,warmup_passes,timed_passes_per_n,device,backend,precision,attn
+1,0.638,0.766,0.833,calm_1,5.00,3,5,Apple M4 MacBook Air 16 GB,"PyTorch MPS, eager",fp16,eager
+4,2.659,0.882,3.014,calm_1,5.00,3,5,Apple M4 MacBook Air 16 GB,"PyTorch MPS, eager",fp16,eager
+8,5.790,1.247,4.644,calm_1,5.00,3,5,Apple M4 MacBook Air 16 GB,"PyTorch MPS, eager",fp16,eager
