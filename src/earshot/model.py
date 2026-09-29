@@ -17,6 +17,7 @@ genuine config issues) still surface because they come through ERROR.
 from __future__ import annotations
 
 import logging
+import sys
 import torch
 
 
@@ -34,13 +35,22 @@ def pick_device() -> torch.device:
     return torch.device("cpu")
 
 
-def load_model():
+def load_model(dtype: torch.dtype = torch.float16):
     """Load the processor + thinker-only model and move it to MPS.
+
+    Args:
+        dtype — torch.float16 (default; production) or torch.float32
+                (exactness check; ~2× memory and ~1.5× wall time). The
+                default matches Stage 0's recipe. The Stage 3/4
+                equivalence test runs in fp16 by default and switches
+                to fp32 via the --fp32 flag for a tighter tolerance
+                proof; if the model doesn't fit in MPS memory in fp32
+                the test moves it to CPU instead.
 
     Returns:
         processor — HuggingFace processor for audio + text tokenisation.
         model — Qwen2_5OmniThinkerForConditionalGeneration in eval() mode
-                on the chosen device, dtype=float16.
+                on the chosen device, dtype as requested.
         device — torch.device the model lives on (so the scorer can cast
                 tensors to the same place).
     """
@@ -61,7 +71,7 @@ def load_model():
         processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
         model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
             MODEL_ID,
-            dtype=torch.float16,
+            dtype=dtype,
             attn_implementation="eager",
             low_cpu_mem_usage=True,
             device_map=None,  # CPU-then-move, see module docstring.
@@ -72,5 +82,18 @@ def load_model():
     model.eval()
 
     device = pick_device()
-    model.to(device)
+    # fp32 weights of Qwen2.5-Omni-3B (~12 GB) won't fit in MPS RAM on a
+    # 16 GB Mac (the OS and the activations take the rest). Fall back to
+    # CPU for the exactness check; slow is fine because the equivalence
+    # test only runs a handful of clips.
+    if dtype == torch.float32 and device.type == "mps":
+        try:
+            model.to(device)
+        except (RuntimeError, MemoryError) as e:
+            print(f"[load_model] fp32 too big for MPS ({e!r}); falling back to CPU",
+                  file=sys.stderr)
+            device = torch.device("cpu")
+            model.to(device)
+    else:
+        model.to(device)
     return processor, model, device

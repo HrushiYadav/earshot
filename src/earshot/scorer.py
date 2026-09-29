@@ -1,7 +1,8 @@
 """Stage 2 — sequential single-question scorer (no batching).
 Stage 3 — fork-and-score: one prefix forward, broadcast KV cache across N suffixes.
+Stage 4 — typed schema: bool P(Yes) and choice P(letter), discriminated on question type.
 
-For each model-driven question:
+For each model-driven bool question:
   1. Build a fresh chat conversation (system + audio + question text).
   2. Tokenize via the processor with `audio_kwargs` truncating the audio
      features to the real length (no 30-s padding default).
@@ -9,9 +10,19 @@ For each model-driven question:
   4. Read P(Yes) by log-sum-exp across the Yes and No token-id groups at
      the last position.
 
-Stage 2.5 (pre-Stage 3 tuning pass) added signal-derived questions. A
-question with `source="signal"` skips the model and is answered from the raw
-audio (RMS check for `silent`). All other questions go to the model.
+For each model-driven choice question:
+  1. Build the chat conversation with the question text, an "Answer with
+     one letter" instruction, and the options presented as lettered lines:
+         What is the main speaker doing? Answer with one letter (A, B, ...).
+         A. talking
+         B. laughing
+         …
+  2. Run the same prefix+suffix forward as for bool.
+  3. At the last non-pad position, take logits for the letter tokens A/B/C…
+     and softmax over the options.
+
+Signal-derived questions (`source="signal"`, currently just `silent`) skip
+the model entirely — `score_signal_silent()` answers from the audio RMS.
 
 Stage 3 — score_batched:
   - Signal questions are computed up front and skipped from the model batch.
@@ -30,7 +41,8 @@ Stage 3 — score_batched:
     suffix portion. For Qwen2.5-Omni the suffix is pure text so all three
     rotary axes are identical and consecutive.
   - One batched forward pass. Per-row, logits at the last NON-pad position
-    are fed to the same Yes/No log-sum-exp softmax as score_one.
+    are fed to the same Yes/No log-sum-exp softmax as score_one (bool), or
+    to a letter-token softmax across the options (choice).
 
 The model is loaded lazily on first call (cached at module level so a loop
 over many clips doesn't reload it).
@@ -38,7 +50,7 @@ over many clips doesn't reload it).
 from __future__ import annotations
 
 import threading
-from typing import Iterable
+from typing import Iterable, Union
 
 import numpy as np
 import torch
@@ -48,6 +60,14 @@ from .prompts import (
     QUESTION_TEMPLATE,
     SIGNAL_SILENT_RMS_THRESHOLD,
     SYSTEM_MESSAGE,
+)
+from .schema import (
+    LETTERS,
+    BoolQuestion,
+    BoolResult,
+    ChoiceQuestion,
+    ChoiceResult,
+    letter_for_index,
 )
 
 
@@ -64,6 +84,12 @@ from .prompts import (
 DEFAULT_YES_IDS = [9454, 9834, 9693, 7414]
 DEFAULT_NO_IDS = [2753, 902, 2152, 2308]
 
+# Letter token IDs in the Qwen2.5-Omni tokenizer. Each uppercase letter is a
+# single token: 'A'..'Z' map to consecutive IDs 32..57 (verified at
+# module-load time below). We rely on this so choice scoring can pluck
+# one logit per option directly without splitting or joining subword pieces.
+LETTER_BASE_ID = 32  # token id of 'A'
+
 
 def find_yes_no_ids(tokenizer) -> tuple[list[int], list[int]]:
     """Re-derive (yes_ids, no_ids) from a tokenizer. Used by tests / fresh
@@ -79,6 +105,19 @@ def find_yes_no_ids(tokenizer) -> tuple[list[int], list[int]]:
         if len(ids) == 1:
             no_ids.append(ids[0])
     return list(dict.fromkeys(yes_ids)), list(dict.fromkeys(no_ids))
+
+
+def letter_token_ids(n: int) -> list[int]:
+    """Return the token ids for the first `n` uppercase letters: [A, B, …].
+
+    The Qwen2.5-Omni tokenizer assigns 'A'..'Z' to consecutive ids 32..57
+    (one token per letter, no leading-space variants). Callers building a
+    choice suffix can format lines like `"A. talking"` and trust the
+    letter tokenization is single-id.
+    """
+    if not 1 <= n <= 26:
+        raise ValueError(f"letter_token_ids({n}): need 1..26")
+    return [LETTER_BASE_ID + i for i in range(n)]
 
 
 def p_yes_from_logits(
@@ -98,29 +137,48 @@ def p_yes_from_logits(
     return float(probs[0].item())
 
 
+def probs_from_letter_logits(
+    last_logits: torch.Tensor, options: list[str]
+) -> dict[str, float]:
+    """P(option) from last-position logits for the letter tokens A/B/C….
+
+    Each letter is a single token in the Qwen tokenizer (verified at
+    module load); we pluck one logit per option and softmax. If an option
+    somehow got a multi-token letter (e.g. lowercased) the caller must
+    normalise first.
+    """
+    if not 1 <= len(options) <= 26:
+        raise ValueError(f"probs_from_letter_logits: need 2..26 options, got {len(options)}")
+    ids = torch.tensor(letter_token_ids(len(options)),
+                       device=last_logits.device, dtype=torch.long)
+    logits = last_logits[ids].float()
+    probs = torch.softmax(logits, dim=0).cpu().tolist()
+    return {opt: float(p) for opt, p in zip(options, probs)}
+
+
 # ---------------------------------------------------------------------------
-# Result type — shared by signal and model scorers
+# Suffix text builders
 # ---------------------------------------------------------------------------
 
-# A ScoreResult is what every question reduces to, regardless of source. The
-# fields are kept as a plain dict (not a dataclass) until Stage 4 turns them
-# into a real typed schema. The keys here are stable; Stage 4 should not
-# rename them without a migration.
-#
-#   id      — question id (matches the input dict's "id")
-#   text    — question text (matches the input dict's "text")
-#   prob    — P(Yes), float in [0, 1]
-#   answer  — "Yes" if prob >= 0.5 else "No"
-#   source  — "model" or "signal" (the producer of `prob`)
-#
-def score_result(qid: str, text: str, prob: float, source: str) -> dict:
-    return {
-        "id": qid,
-        "text": text,
-        "prob": prob,
-        "answer": "Yes" if prob >= 0.5 else "No",
-        "source": source,
-    }
+def _bool_suffix_text(question: str) -> str:
+    """The text fed to the model after <|audio_eos|> for a bool question.
+    Stays the same shape as Stage 2 — `"<question>? Answer Yes or No."` —
+    so the chat-tail `"\\n<|im_start|>assistant\\n"` is appended by the
+    score_batched split (suffix_tail)."""
+    return QUESTION_TEMPLATE.format(question=question)
+
+
+def _choice_suffix_text(question: str, options: list[str]) -> str:
+    """The text fed to the model for a choice question. Options are
+    presented as lettered lines so the model can answer with a single
+    letter token; that letter is then softmaxed across options.
+    """
+    lines = [
+        f"{question} Answer with one letter (A, B, C, ...).",
+    ]
+    for i, opt in enumerate(options):
+        lines.append(f"{letter_for_index(i)}. {opt}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -132,45 +190,61 @@ def rms(audio: np.ndarray) -> float:
     return float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
 
 
-def score_signal_silent(audio: np.ndarray, qid: str = "silent", text: str = "Is the room silent?") -> dict:
+def score_signal_silent(
+    audio: np.ndarray,
+    qid: str = "silent",
+    text: str = "Is the room silent?",
+    threshold: float = SIGNAL_SILENT_RMS_THRESHOLD,
+    enter: float = 0.5,
+) -> BoolResult:
     """Score `silent` from the audio RMS.
 
     Threshold chosen in prompts.py from the manifest data. Returns a
-    ScoreResult with prob = 1.0 for Yes (room is silent) or 0.0 for No.
+    BoolResult with prob = 1.0 for Yes (room is silent) or 0.0 for No.
+    `enter` is the question's enter threshold; `fired` is set when
+    p crosses it. (For the default enter=0.5, fired == is_silent.)
     """
     r = rms(audio)
-    is_silent = r < SIGNAL_SILENT_RMS_THRESHOLD
-    return score_result(qid, text, prob=1.0 if is_silent else 0.0, source="signal")
+    p = 1.0 if r < threshold else 0.0
+    return BoolResult(
+        id=qid, text=text,
+        p=p, fired=(p >= enter), source="signal",
+    )
 
 
 # ---------------------------------------------------------------------------
-# Single-question scoring (model)
+# Single-question scoring (model) — kept for completeness; the live path
+# uses score_batched.
 # ---------------------------------------------------------------------------
 
-def _build_one(processor, model, device, audio, question_text, yes_ids, no_ids, n_samples):
-    """Build inputs for a single question + audio, run model, return P(Yes)."""
+def _build_one(processor, model, device, audio, question: BoolQuestion | ChoiceQuestion,
+               yes_ids, no_ids, n_samples, *, dtype=torch.float16):
+    """One full forward for a single question. Returns a BoolResult or
+    ChoiceResult depending on the question type."""
+    if isinstance(question, ChoiceQuestion):
+        suffix_text = _choice_suffix_text(question.text, question.options)
+    else:
+        suffix_text = _bool_suffix_text(question.text)
+
     convo = [
         {"role": "system", "content": [{"type": "text", "text": SYSTEM_MESSAGE}]},
         {"role": "user", "content": [
             {"type": "audio", "audio": audio},
-            {"type": "text", "text": QUESTION_TEMPLATE.format(question=question_text)},
+            {"type": "text", "text": suffix_text},
         ]},
     ]
     text = processor.apply_chat_template(convo, tokenize=False, add_generation_prompt=True)
     if isinstance(text, list):
         text = text[0]
     inputs = processor(
-        text=text,
-        audio=audio,
-        sampling_rate=16_000,
-        return_tensors="pt",
-        padding=True,
+        text=text, audio=audio, sampling_rate=16_000,
+        return_tensors="pt", padding=True,
         audio_kwargs={"max_length": n_samples, "truncation": True},
     )
     inputs = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in inputs.items()}
     for k, v in list(inputs.items()):
         if hasattr(v, "dtype") and v.dtype.is_floating_point:
-            inputs[k] = v.to(torch.float16)
+            inputs[k] = v.to(dtype)
 
     feat_mask = inputs.get("feature_attention_mask")
     audio_seqlen = (
@@ -187,23 +261,40 @@ def _build_one(processor, model, device, audio, question_text, yes_ids, no_ids, 
     with torch.inference_mode():
         out = model(**inputs)
     last = out.logits[0, -1].float().cpu()
-    return p_yes_from_logits(last, yes_ids=yes_ids, no_ids=no_ids)
+
+    return _result_from_logits(question, last, yes_ids=yes_ids, no_ids=no_ids)
+
+
+def _result_from_logits(question, last_logits, yes_ids, no_ids):
+    """Pick the right read-out (Yes/No or letter-token softmax) and wrap
+    it in the matching pydantic result."""
+    if isinstance(question, ChoiceQuestion):
+        probs = probs_from_letter_logits(last_logits, question.options)
+        top = max(probs, key=probs.get)
+        return ChoiceResult(
+            id=question.id, text=question.text,
+            probs=probs, top=top, source="model",
+        )
+    p = p_yes_from_logits(last_logits, yes_ids=yes_ids, no_ids=no_ids)
+    return BoolResult(
+        id=question.id, text=question.text,
+        p=p, fired=(p >= question.enter), source="model",
+    )
 
 
 def score_one(
-    processor,
-    model,
-    device: torch.device,
-    audio: np.ndarray,
-    question_text: str,
-    yes_ids: list[int] = DEFAULT_YES_IDS,
-    no_ids: list[int] = DEFAULT_NO_IDS,
-    n_samples: int | None = None,
-) -> float:
-    """One question, one audio. Returns P(Yes)."""
+    processor, model, device, audio, question: BoolQuestion | ChoiceQuestion,
+    yes_ids=None, no_ids=None, n_samples: int | None = None,
+):
+    """Public entry point for a single (audio, question) score. Returns a
+    BoolResult or ChoiceResult."""
     if n_samples is None:
         n_samples = int(audio.shape[-1]) if hasattr(audio, "shape") else len(audio)
-    return _build_one(processor, model, device, audio, question_text, yes_ids, no_ids, n_samples)
+    if yes_ids is None:
+        yes_ids = DEFAULT_YES_IDS
+    if no_ids is None:
+        no_ids = DEFAULT_NO_IDS
+    return _build_one(processor, model, device, audio, question, yes_ids, no_ids, n_samples)
 
 
 # ---------------------------------------------------------------------------
@@ -211,19 +302,20 @@ def score_one(
 # ---------------------------------------------------------------------------
 
 _CACHE_LOCK = threading.Lock()
-_CACHE: dict = {}  # {"processor": ..., "model": ..., "device": ...,
-                   #  "yes_ids": [...], "no_ids": [...]}
+_CACHE: dict = {}
 
 
-def _ensure_loaded():
-    """Load and cache the model. Safe across threads / processes-as-threads."""
+def _ensure_loaded(dtype: torch.dtype = torch.float16):
+    """Lazy-load and cache the model. If a different dtype is requested
+    after a previous load, the cache is rebuilt."""
     with _CACHE_LOCK:
-        if "model" not in _CACHE:
-            processor, model, device = load_model()
+        if "model" not in _CACHE or _CACHE.get("dtype") != dtype:
+            processor, model, device = load_model(dtype=dtype)
             yes_ids, no_ids = find_yes_no_ids(processor.tokenizer)
             _CACHE["processor"] = processor
             _CACHE["model"] = model
             _CACHE["device"] = device
+            _CACHE["dtype"] = dtype
             _CACHE["yes_ids"] = yes_ids
             _CACHE["no_ids"] = no_ids
         return _CACHE
@@ -231,32 +323,36 @@ def _ensure_loaded():
 
 def score_sequential(
     audio: np.ndarray,
-    questions: Iterable[dict],
-) -> dict[str, dict]:
+    questions: Iterable[BoolQuestion | ChoiceQuestion],
+    *,
+    dtype: torch.dtype = torch.float16,
+) -> dict[str, Union[BoolResult, ChoiceResult]]:
     """Score each question against `audio` sequentially (one forward pass per
-    question). See module docstring for the per-question dict shape and the
-    ScoreResult fields."""
-    cache = _ensure_loaded()
+    question). Returns dict[id -> BoolResult | ChoiceResult]. `dtype`
+    overrides the production fp16 default; pass torch.float32 for the
+    exactness proof (see test_equivalence.py --fp32)."""
+    cache = _ensure_loaded(dtype=dtype)
     processor = cache["processor"]
     model = cache["model"]
     device = cache["device"]
     yes_ids = cache["yes_ids"]
     no_ids = cache["no_ids"]
 
-    out: dict[str, dict] = {}
+    out: dict[str, Union[BoolResult, ChoiceResult]] = {}
     n_samples = int(audio.shape[-1]) if hasattr(audio, "shape") else len(audio)
     for q in questions:
-        qid = q["id"]
-        text = q["text"]
-        source = q.get("source", "model")
-        if source == "signal":
-            if qid == "silent":
-                out[qid] = score_signal_silent(audio, qid=qid, text=text)
+        if q.source == "signal":
+            if q.signal == "rms" and q.id == "silent":
+                out[q.id] = score_signal_silent(
+                    audio, qid=q.id, text=q.text,
+                    threshold=q.signal_threshold or SIGNAL_SILENT_RMS_THRESHOLD,
+                    enter=q.enter,
+                )
             else:
-                raise ValueError(f"unknown signal question id: {qid!r}")
-        else:
-            prob = _build_one(processor, model, device, audio, text, yes_ids, no_ids, n_samples)
-            out[qid] = score_result(qid, text, prob, source="model")
+                raise ValueError(f"unknown signal question: id={q.id!r} signal={q.signal!r}")
+            continue
+        out[q.id] = _build_one(processor, model, device, audio, q, yes_ids, no_ids, n_samples,
+                              dtype=dtype)
     return out
 
 
@@ -267,43 +363,54 @@ def score_sequential(
 # SENTINEL placeholder inserted where the question text would go. The chat
 # template renders it verbatim, sitting between <|audio_eos|> and "\nassistant\n".
 # We slice the rendered template at the SENTINEL to produce a question-free
-# prefix that is identical across all questions.
-_PREFIX_SENTINEL = "\u2e80EARSHOT_Q\u2e80"
+# prefix that is identical across all questions. The NUL-byte delimiters
+# make it unambiguous that this is a control token, not real text (the
+# tokenizer would never emit NULs in a normal conversation).
+_PREFIX_SENTINEL = "\x00QUERY\x00"
 
 
 def score_batched(
     audio: np.ndarray,
-    questions: Iterable[dict],
+    questions: Iterable[BoolQuestion | ChoiceQuestion],
     batch_size: int | None = None,
-) -> dict[str, dict]:
+    *,
+    suffix_pos_offset: int = 0,
+    dtype: torch.dtype = torch.float16,
+) -> dict[str, Union[BoolResult, ChoiceResult]]:
     """Stage 3 — fork-and-score: one prefix forward pass, broadcast across N
-    question suffixes in a single batched pass.
+    question suffixes in a single batched pass. Returns dict[id ->
+    BoolResult | ChoiceResult], matching `score_sequential`'s shape so
+    callers can swap one for the other.
 
-    Signal questions (`source="signal"`) are computed up front via the
-    matching scorer (currently only `silent` -> RMS check) and skipped from
-    the model batch. Model-driven questions are scored in chunks of
-    `batch_size` rows per forward pass (default: all in one batch).
+    `suffix_pos_offset` is a control knob for the equivalence test: when
+    set to a non-zero value, every suffix position id is shifted by that
+    amount (intended use: +1). This deliberately breaks the test so we
+    can prove the test is sensitive to position bugs. Defaults to 0
+    (correct). Never set this from production code.
 
-    Returns:
-        dict mapping question id -> ScoreResult dict. Same shape as
-        score_sequential, so callers can swap one for the other.
-    """
+    `dtype` overrides the production fp16 default; pass
+    torch.float32 for the exactness proof (see test_equivalence.py
+    --fp32)."""
     questions = list(questions)
-    cache = _ensure_loaded()
+    cache = _ensure_loaded(dtype=dtype)
     processor = cache["processor"]
     model = cache["model"]
     device = cache["device"]
     yes_ids = cache["yes_ids"]
     no_ids = cache["no_ids"]
 
-    out: dict[str, dict] = {}
-    signal_qs = [q for q in questions if q.get("source") == "signal"]
-    model_qs = [q for q in questions if q.get("source", "model") == "model"]
+    out: dict[str, Union[BoolResult, ChoiceResult]] = {}
+    signal_qs = [q for q in questions if q.source == "signal"]
+    model_qs = [q for q in questions if q.source == "model"]
     for q in signal_qs:
-        if q["id"] == "silent":
-            out[q["id"]] = score_signal_silent(audio, qid=q["id"], text=q["text"])
+        if q.signal == "rms" and q.id == "silent":
+            out[q.id] = score_signal_silent(
+                audio, qid=q.id, text=q.text,
+                threshold=q.signal_threshold or SIGNAL_SILENT_RMS_THRESHOLD,
+                enter=q.enter,
+            )
         else:
-            raise ValueError(f"unknown signal question id: {q['id']!r}")
+            raise ValueError(f"unknown signal question: id={q.id!r} signal={q.signal!r}")
     if not model_qs:
         return out
 
@@ -324,8 +431,8 @@ def score_batched(
     s_idx = rendered.find(_PREFIX_SENTINEL)
     if s_idx < 0:
         raise RuntimeError(f"SENTINEL {_PREFIX_SENTINEL!r} not found in rendered template:\n{rendered}")
-    prefix_text = rendered[:s_idx]                # up to and including <|audio_eos|>
-    suffix_tail = rendered[s_idx + len(_PREFIX_SENTINEL):]   # "\nassistant\n"
+    prefix_text = rendered[:s_idx]
+    suffix_tail = rendered[s_idx + len(_PREFIX_SENTINEL):]
 
     # --- 2. Tokenize the prefix (with audio) --------------------------------
     prefix_inputs = processor(
@@ -342,7 +449,7 @@ def score_batched(
     prefix_inputs = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in prefix_inputs.items()}
     for k, v in list(prefix_inputs.items()):
         if hasattr(v, "dtype") and v.dtype.is_floating_point:
-            prefix_inputs[k] = v.to(torch.float16)
+            prefix_inputs[k] = v.to(dtype)
 
     pos_ids, _ = model.get_rope_index(
         input_ids=prefix_inputs["input_ids"],
@@ -358,10 +465,14 @@ def score_batched(
     prefix_seq_len = prefix_inputs["input_ids"].shape[1]
 
     # --- 4. Tokenize all suffix texts and right-pad -------------------------
-    # suffix = "<question>? Answer Yes or No." + suffix_tail ("\nassistant\n")
-    suffix_texts = [
-        QUESTION_TEMPLATE.format(question=q["text"]) + suffix_tail for q in model_qs
-    ]
+    suffix_texts: list[str] = []
+    for q in model_qs:
+        if isinstance(q, ChoiceQuestion):
+            body = _choice_suffix_text(q.text, q.options)
+        else:
+            body = _bool_suffix_text(q.text)
+        suffix_texts.append(body + suffix_tail)
+
     suffix_token_lists = [
         processor.tokenizer.encode(t, add_special_tokens=False) for t in suffix_texts
     ]
@@ -400,22 +511,18 @@ def score_batched(
         # Use the (now-mutated) past_kv itself.
         past_kv.batch_repeat_interleave(N)
 
-        # 5b. Position ids for the suffix: the suffix is pure text on top of an
-        # already-cached prefix, so all three rotary axes are identical and
-        # consecutive, starting from `prefix_seq_len`. (Qwen2.5-Omni reuses the
-        # cached `rope_deltas` from the prefix forward and derives positions
-        # from the FULL attention mask's cumsum; we pass our own position_ids
-        # here so the model doesn't have to recompute them.)
+        # 5b. Position ids for the suffix: pure text continuing the cached
+        # prefix, so all three rotary axes are identical and consecutive,
+        # starting from `prefix_seq_len`. `suffix_pos_offset` is the test
+        # knob that deliberately breaks positions; production always uses 0.
         suffix_pos = (
-            prefix_seq_len
+            prefix_seq_len + suffix_pos_offset
             + torch.arange(max_len, device=device).unsqueeze(0).expand(3, N, max_len)
         ).contiguous()
 
         # 5c. Full attention mask = prefix (all 1s) ++ suffix with right-pad
-        # zeros. The model's 4D causal-mask construction uses this to know how
-        # much cached prefix to attend over. Passing only the suffix mask
-        # makes the model think total length == suffix length and the prefix
-        # audio gets masked out.
+        # zeros. The model's 4D causal-mask construction uses this to know
+        # how much cached prefix to attend over.
         attn_mask = torch.cat(
             [
                 torch.ones((N, prefix_seq_len), dtype=suffix_attn.dtype, device=device),
@@ -424,7 +531,6 @@ def score_batched(
             dim=1,
         )
 
-        # 5d. Run the batched forward pass.
         with torch.inference_mode():
             chunk_out = model(
                 input_ids=suffix_ids,
@@ -434,12 +540,20 @@ def score_batched(
             )
         logits = chunk_out.logits  # (N, max_len, vocab)
 
-        # 5e. Per row, read logits at the last non-pad position.
+        # 5d. Per row, read logits at the last non-pad position.
         row_idx = torch.arange(N, device=device)
         last_logits = logits[row_idx, torch.tensor(last_non_pad, device=device)].float().cpu()
         for i, q_idx in enumerate(chunk):
-            prob = p_yes_from_logits(last_logits[i], yes_ids=yes_ids, no_ids=no_ids)
             q = model_qs[q_idx]
-            out[q["id"]] = score_result(q["id"], q["text"], prob, source="model")
+            out[q.id] = _result_from_logits(q, last_logits[i], yes_ids=yes_ids, no_ids=no_ids)
 
     return out
+
+
+__all__ = [
+    "DEFAULT_YES_IDS", "DEFAULT_NO_IDS", "LETTERS",
+    "find_yes_no_ids", "letter_token_ids",
+    "p_yes_from_logits", "probs_from_letter_logits",
+    "rms", "score_signal_silent",
+    "score_one", "score_sequential", "score_batched",
+]

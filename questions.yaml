@@ -1,0 +1,138 @@
+# earshot production question set.
+#
+# Each entry is either a bool question (P(Yes) at last position) or a choice
+# question (P(A/B/...) at last position, softmaxed across options).
+#
+# Fields:
+#   id           — short stable identifier; manifest_col and scorer return key
+#   type         — "bool" (P(Yes)) or "choice" (softmax across letter tokens)
+#   text         — the natural-language question shown to the model
+#   manifest_col — column in clips/manifest.csv used by eval_clips.py (None OK)
+#   smoothing    — EMA alpha used by the live loop (Stage 5); default 0.5.
+#                  0.0 = frozen, 1.0 = no smoothing
+#   enter        — (bool only) P(Yes) at or above which the answer fires. default 0.5
+#   exit         — (bool only) P(Yes) at or below which the state returns to "No".
+#                  default 0.4 (so the deadband is 0.1 unless overridden)
+#   source       — "model" (LM forward) or "signal" (computed from audio)
+#   signal       — (signal-source bool only) which signal — currently just "rms"
+#   signal_threshold — (signal-source bool only) cutoff for the signal
+#   options      — (choice only) the choice options, in order; lettered A, B, C…
+#
+# IMPORTANT: do not add or change questions without checking with the user.
+# Earlier passes grew this set speculatively and the additions had no
+# labelled clips to test them on, so they only inflated the runtime.
+
+questions:
+  # --- Tier 2: bool, answered by the shared-prefix LM batch ---
+  - id: is_speaking
+    type: bool
+    text: "Is someone speaking?"
+    manifest_col: is_speaking
+    enter: 0.5
+    exit: 0.4
+    smoothing: 0.5
+    source: model
+
+  - id: multiple_speakers
+    type: bool
+    text: "Is more than one person speaking?"
+    manifest_col: multiple_speakers
+    enter: 0.5
+    exit: 0.4
+    smoothing: 0.5
+    source: model
+
+  - id: music
+    type: bool
+    text: "Is music playing?"
+    manifest_col: music
+    enter: 0.5
+    exit: 0.4
+    smoothing: 0.5
+    source: model
+
+  - id: angry
+    type: bool
+    text: "Does the speaker sound angry or stressed?"
+    manifest_col: angry
+    enter: 0.5
+    exit: 0.4
+    smoothing: 0.5
+    source: model
+
+  - id: said_stop
+    type: bool
+    text: 'Did someone say the word "stop"?'
+    manifest_col: said_stop
+    enter: 0.5
+    exit: 0.4
+    smoothing: 0.5
+    source: model
+
+  - id: clapping
+    type: bool
+    text: "Is there clapping?"
+    manifest_col: clapping
+    enter: 0.5
+    exit: 0.4
+    smoothing: 0.5
+    source: model
+
+  - id: phone_or_alarm
+    type: bool
+    text: "Is a phone or alarm ringing?"
+    manifest_col: phone_or_alarm
+    enter: 0.5
+    exit: 0.4
+    smoothing: 0.5
+    source: model
+
+  - id: typing
+    type: bool
+    text: "Is someone typing on a keyboard?"
+    manifest_col: typing
+    enter: 0.5
+    exit: 0.4
+    smoothing: 0.5
+    source: model
+
+  - id: door_knock
+    type: bool
+    text: "Is someone knocking on a door?"
+    manifest_col: door_knock
+    enter: 0.5
+    exit: 0.4
+    smoothing: 0.5
+    source: model
+
+  # --- Tier 1: bool, answered from the audio RMS (no LM call) ---
+  - id: silent
+    type: bool
+    text: "Is the room silent?"
+    manifest_col: silent
+    enter: 0.5
+    exit: 0.4
+    smoothing: 0.5
+    source: signal
+    signal: rms
+    # Picked from clips/manifest data: midpoint between the loudest
+    # expected-silent clip (room_noise_1 rms=0.004966) and the quietest
+    # expected-non-silent clip (alarm_1 rms=0.005111). Round to 0.00505.
+    signal_threshold: 0.00505
+
+  # --- Tier 2: choice, lettered A/B/C/..., softmaxed across letters ---
+  - id: main_sound
+    type: choice
+    text: "What is the dominant sound in the audio?"
+    manifest_col: main_sound
+    smoothing: 0.5
+    # Option list MUST match the manifest ground-truth values exactly:
+    #   speech — calm/loud/two_voices/stop/no_stop clips
+    #   music  — music_*/music_speech_* clips
+    #   noise  — alarm_*/typing_1/knock_1 clips
+    #   silence — silence_*/room_noise_1 clips
+    options:
+      - speech
+      - music
+      - noise
+      - silence
