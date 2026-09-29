@@ -1,10 +1,25 @@
-"""Prompts — single source for system messages and question templates.
+"""Prompts — system message, question template, and the YAML question loader.
 
-Per the AGENTS.md rule that prompt text should live in one place, this module is
-the only place that should contain the system message, the question template,
-and any per-question definitions. Other modules import from here.
+Per the AGENTS.md rule that prompt text should live in one place, this
+module owns the system message, the bool question template, and the
+signal threshold for `silent`. The actual question definitions live in
+`questions.yaml` at the repo root; we load and re-export them from here
+so the rest of the codebase has a single import surface for prompts.
+
+Stage 2 history: this module used to define STARTER_BOOL_QUESTIONS as a
+list of dicts. Stage 4 replaced those dicts with pydantic models
+(`earshot.schema.BoolQuestion` / `ChoiceQuestion`) loaded from YAML.
 """
 from __future__ import annotations
+
+from pathlib import Path
+
+from .schema import (
+    BoolQuestion,
+    ChoiceQuestion,
+    Question,
+    load_questions,
+)
 
 
 # Default system message sent before every question. Phrased so the model
@@ -17,92 +32,8 @@ SYSTEM_MESSAGE = (
 
 
 # Format: a fragment appended to whatever the user wants to ask, so the model
-# is encouraged to answer binary rather than ramble.
+# is encouraged to answer binary rather than ramble. Used for bool questions.
 QUESTION_TEMPLATE = "{question} Answer Yes or No."
-
-
-# Production bool questions. Folded in from the Stage 2.5 tuning pass:
-#   - `angry` wording was changed to the variant that scored 19/21 in eval
-#     (vs the original's 18/21). Variant wording is also more concrete
-#     ("shouting or speaking with a raised voice" vs "angry or stressed"),
-#     which made the model more selective — that traded 2 FPs on clap/stop
-#     for 2 FNs on the actual loud clips. Kept the variant on the user's
-#     "keep the higher-scoring text" rule; flagged in eval output.
-#   - `clapping` wording kept the original ("Is there clapping?"); v2
-#     ("Is someone clapping their hands?") tied 20/21 = 20/21 — no reason
-#     to switch when the original is shorter.
-#   - `typing` was promoted from variant after scoring 20/21 = 0.952; only
-#     miss is silence_1 (probably a start-of-recording click being read as
-#     typing).
-#
-#   id           — short stable identifier used as the manifest column name
-#                  and the score_sequential return key.
-#   text         — the natural-language question shown to the model.
-#   manifest_col — the matching column in clips/manifest.csv used by
-#                  scripts/eval_clips.py for accuracy.
-#   source       — optional, defaults to "model". Set to "signal" for
-#                  questions answered from raw audio (currently just `silent`,
-#                  which uses RMS).
-STARTER_BOOL_QUESTIONS: list[dict] = [
-    {
-        "id": "is_speaking",
-        "text": "Is someone speaking?",
-        "manifest_col": "is_speaking",
-    },
-    {
-        "id": "multiple_speakers",
-        "text": "Is more than one person speaking?",
-        "manifest_col": "multiple_speakers",
-    },
-    {
-        "id": "music",
-        "text": "Is music playing?",
-        "manifest_col": "music",
-    },
-    {
-        "id": "angry",
-        # Reverted to original Stage 2 wording after the tuning pass:
-        # angry_v2 ("shouting or speaking with a raised voice") scored 19/21
-        # but flipped the miss type to FN and caught 0/2 angry clips. The
-        # original wording caught 2/2 loud clips with 3 FPs (clap_1,
-        # stop_1, no_stop_1); Stage 7 calibration handles those via a
-        # per-question threshold.
-        "text": "Does the speaker sound angry or stressed?",
-        "manifest_col": "angry",
-    },
-    {
-        "id": "said_stop",
-        "text": 'Did someone say the word "stop"?',
-        "manifest_col": "said_stop",
-    },
-    {
-        "id": "clapping",
-        # Original wording kept; v2 variant tied 20/21.
-        "text": "Is there clapping?",
-        "manifest_col": "clapping",
-    },
-    {
-        "id": "phone_or_alarm",
-        "text": "Is a phone or alarm ringing?",
-        "manifest_col": "phone_or_alarm",
-    },
-    {
-        "id": "silent",
-        # Answered from the audio RMS, not the model — see
-        # scorer.score_signal_silent. The text above is still useful for
-        # typed output (Stage 4 schema) so the user sees the question that
-        # was answered.
-        "text": "Is the room silent?",
-        "manifest_col": "silent",
-        "source": "signal",
-    },
-    {
-        # Promoted from variant after scoring 20/21 = 0.952 in tuning pass.
-        "id": "typing",
-        "text": "Is someone typing on a keyboard?",
-        "manifest_col": "typing",
-    },
-]
 
 
 # Threshold (RMS over the audio window) below which we consider the room
@@ -114,16 +45,38 @@ STARTER_BOOL_QUESTIONS: list[dict] = [
 #   ... everything else is well above 0.01.
 # Midpoint between the loudest "silent" and the quietest "non-silent" is
 # 0.005039; we round up to 0.00505 to keep the gap on the alarm side.
+# This is also written into questions.yaml's `silent` entry as
+# `signal_threshold`, so the YAML and the constant agree. The YAML value
+# wins at runtime; the constant here is the historical source and a sane
+# fallback if the YAML is unavailable.
 SIGNAL_SILENT_RMS_THRESHOLD = 0.00505
 
 
-def question_text(question_id: str) -> str:
+# Default YAML path (lives at the repo root, next to pyproject.toml).
+DEFAULT_QUESTIONS_PATH = Path(__file__).resolve().parent.parent.parent / "questions.yaml"
+
+
+def load_default_questions() -> list[Question]:
+    """Load the production question set from `questions.yaml`."""
+    return load_questions(DEFAULT_QUESTIONS_PATH)
+
+
+def question_text(question_id: str, questions: list[Question] | None = None) -> str:
     """Look up the natural-language text for a question by id.
 
-    Raises KeyError if the id isn't in STARTER_BOOL_QUESTIONS — that's a
+    Raises KeyError if the id isn't in the loaded question set — that's a
     programmer error, not a runtime one, and should surface loudly.
     """
-    for q in STARTER_BOOL_QUESTIONS:
-        if q["id"] == question_id:
-            return q["text"]
+    qs = questions if questions is not None else load_default_questions()
+    for q in qs:
+        if q.id == question_id:
+            return q.text
     raise KeyError(f"unknown question id: {question_id!r}")
+
+
+__all__ = [
+    "SYSTEM_MESSAGE", "QUESTION_TEMPLATE", "SIGNAL_SILENT_RMS_THRESHOLD",
+    "BoolQuestion", "ChoiceQuestion", "Question",
+    "DEFAULT_QUESTIONS_PATH", "load_default_questions", "load_questions",
+    "question_text",
+]

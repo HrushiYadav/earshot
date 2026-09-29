@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Evaluate every model-driven question (originals + variants) against the manifest.
+"""Evaluate every model-driven question in `questions.yaml` against the manifest.
 
-Reads clips/manifest.csv (gitignored) and clips/<label>.wav, runs each of
-ALL_BOOL_QUESTIONS from earshot.prompts against each clip sequentially, and
+Reads clips/manifest.csv (gitignored) and clips/<label>.wav, runs each
+question from `questions.yaml` sequentially against every clip, and
 prints:
 
   - the signal-derived `silent` threshold picked from the manifest data
-  - a wide per-clip × per-question P(Yes) table (with source tag)
+  - a wide per-clip × per-question P(Yes) / P(top) table (with source tag)
   - per-question accuracy at the threshold, broken down into Yes-caught
     and No-correct counts
-  - an originals-vs-variants side-by-side comparison grouped by manifest_col
-  - a list of every remaining miss (clip, question, expected, prob)
+  - the remaining miss list (clip, question, expected, prob)
 
-Stage 3 will add a fork-and-score mode; this script stays sequential so the
-output is comparable across stages.
+Stage 4 change: questions are loaded from `questions.yaml` via the
+typed schema (`BoolQuestion` / `ChoiceQuestion`) instead of a hard-coded
+list. Bool cells show P(Yes); choice cells show P(top) for now (the
+eval manifest only carries Yes/No labels).
+
+Stage 3 will add a fork-and-score mode; this script stays sequential so
+the output is comparable across stages.
 """
 from __future__ import annotations
 
@@ -28,9 +32,15 @@ import soundfile as sf
 
 from earshot.prompts import (
     SIGNAL_SILENT_RMS_THRESHOLD,
-    STARTER_BOOL_QUESTIONS,
+    load_default_questions,
 )
-from earshot.scorer import rms, score_sequential
+from earshot.scorer import (
+    BoolResult,
+    ChoiceResult,
+    rms,
+    score_sequential,
+)
+from earshot.schema import BoolQuestion, ChoiceQuestion
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -56,16 +66,27 @@ def load_audio(wav_path: Path) -> np.ndarray:
     return audio.astype(np.float32)
 
 
+def _result_p(res) -> float:
+    """Cell display value: P(Yes) for bool, P(top) for choice."""
+    if isinstance(res, BoolResult):
+        return res.p
+    if isinstance(res, ChoiceResult):
+        return res.probs.get(res.top, 0.0)
+    raise TypeError(f"unknown result type: {type(res)}")
+
+
+def _result_source(res) -> str:
+    return getattr(res, "source", "model")
+
+
 def _format_table(clip_results, questions, threshold) -> str:
-    """Wide per-clip × per-question P(Yes) table. Cell shows prob + a
-    one-letter source tag (M=model, S=signal). Cell suffix shows the
-    binary answer in parentheses when it disagrees with P(Yes)>=0.5
-    (basically never — kept as a sanity check)."""
-    cols = [q["id"] for q in questions]
+    """Wide per-clip × per-question table. Cell shows prob (P(Yes) for bool,
+    P(top) for choice) plus a one-letter source tag (M=model, S=signal)."""
+    cols = [q.id for q in questions]
     header = "{:<22s}".format("clip")
     for c in cols:
-        header += "{:>9s}".format(c[:8])
-    header += "{:>9s}".format("rms")
+        header += "{:>10s}".format(c[:9])
+    header += "{:>10s}".format("rms")
     lines = [header, "-" * len(header)]
     for label, scores in clip_results:
         sr = scores.get("__rms__")
@@ -73,107 +94,142 @@ def _format_table(clip_results, questions, threshold) -> str:
         for c in cols:
             res = scores.get(c)
             if res is None:
-                row += "{:>9s}".format("   —    ")
+                row += "{:>10s}".format("   —    ")
                 continue
-            p = res["prob"]
-            src = "S" if res["source"] == "signal" else "M"
-            cell = f"{p:.3f}{src}"
-            if (p >= 0.5) != (res["answer"] == "Yes"):
-                cell = "!" + cell[1:]
-            row += "{:>9s}".format(cell)
-        row += "{:>9.4f}".format(sr if sr is not None else 0.0)
+            p = _result_p(res)
+            src = "S" if _result_source(res) == "signal" else "M"
+            row += "{:>10s}".format(f"{p:.3f}{src}")
+        row += "{:>10.4f}".format(sr if sr is not None else 0.0)
         lines.append(row)
     return "\n".join(lines)
 
 
 def _per_question(clip_results, manifest_by_label, questions, threshold):
-    """For each question: (correct, total, yes_caught, yes_total, no_correct, no_total)."""
+    """For each question, compute per-question accuracy and split counts.
+
+    Bool: scored as "predicted label == manifest label" (Yes/No). The
+    per-option breakdown uses the same Yes/No buckets so the bool row
+    shows `yes_caught=11/11 no_correct=10/10`.
+    Choice: scored as "predicted top option == manifest value" (e.g. the
+            manifest's `main_sound` cell). Per-option counts are
+            tracked per option name.
+    """
     stats: dict[str, dict] = {}
     for q in questions:
-        col = q["manifest_col"]
-        s = {"correct": 0, "total": 0, "yes_correct": 0, "yes_total": 0,
-             "no_correct": 0, "no_total": 0}
+        col = q.manifest_col
+        s = {"correct": 0, "total": 0}
+        per_option_hits: dict[str, list[int]] = {}
+        per_option_totals: dict[str, int] = {}
         for label, scores in clip_results:
             m = manifest_by_label.get(label)
             if m is None:
                 continue
-            expected = m.get(col, "")
-            if expected not in ("Yes", "No"):
+            expected = m.get(col or "", "")
+            if not expected:
                 continue
-            res = scores.get(q["id"])
+            res = scores.get(q.id)
             if res is None:
                 continue
-            predicted = res["answer"]
+            predicted = _predicted_from_result(res)
+            if predicted is None:
+                continue
             ok = predicted == expected
             s["total"] += 1
             s["correct"] += int(ok)
-            if expected == "Yes":
-                s["yes_total"] += 1
-                s["yes_correct"] += int(ok)
-            else:
-                s["no_total"] += 1
-                s["no_correct"] += int(ok)
-        stats[q["id"]] = s
+            # Both bool (Yes/No) and choice (option name) get per-bucket
+            # counts so the accuracy table can show caught / total per bucket.
+            per_option_totals[expected] = per_option_totals.get(expected, 0) + 1
+            per_option_hits.setdefault(expected, []).append(int(ok))
+        s["per_option_hits"] = per_option_hits
+        s["per_option_totals"] = per_option_totals
+        stats[q.id] = s
     return stats
 
 
+def _predicted_from_result(res) -> str | None:
+    """Map a typed result to a string label for eval.
+
+    bool → "Yes" if fired else "No".
+    choice → res.top (the highest-probability option). For main_sound
+    the manifest values are speech / music / noise / silence — exact
+    string match with the option list.
+    """
+    if isinstance(res, BoolResult):
+        return "Yes" if res.fired else "No"
+    if isinstance(res, ChoiceResult):
+        return res.top
+    return None
+
+
 def _format_accuracy(stats: dict[str, dict], questions) -> str:
-    out = []
-    out.append(f"accuracy at P(Yes) >= 0.5 — split by expected label")
-    out.append(f"  {'question':<18s}{'src':>4s}{'correct':>9s}{'total':>7s}{'acc':>8s}"
-               f"  {'yes_caught':>12s}{'no_correct':>12s}")
-    out.append("  " + "-" * 70)
-    total_c = total_t = total_yc = total_yt = total_nc = total_nt = 0
+    """Per-question accuracy. Bool questions show Yes-caught / No-correct;
+    choice questions show per-option hit counts (e.g. `speech 3/3`,
+    `music 2/4`). The OVERALL row is the unweighted mean of per-question
+    accuracy so a 100%-trivially-clipped question can't drag it up.
+    """
+    out = ["per-question accuracy"]
+    out.append("  bool: split by expected Yes / No (correct / total)")
+    out.append("  choice: split by expected option (caught / total)")
+    out.append("")
+    out.append(f"  {'question':<20s}{'src':>4s}{'kind':>8s}{'correct':>9s}"
+               f"{'total':>7s}{'acc':>8s}  breakdown")
+    out.append("  " + "-" * 86)
+    per_q_acc = []
     for q in questions:
-        s = stats[q["id"]]
-        acc = (s["correct"] / s["total"]) if s["total"] else 0.0
-        yc_yt = f"{s['yes_correct']}/{s['yes_total']}"
-        nc_nt = f"{s['no_correct']}/{s['no_total']}"
-        src = "M" if q["id"] != "silent" else "S"
-        out.append(f"  {q['id']:<18s}{src:>4s}{s['correct']:>9d}{s['total']:>7d}{acc:>8.3f}"
-                   f"  {yc_yt:>12s}{nc_nt:>12s}")
-        total_c += s["correct"]
-        total_t += s["total"]
-        total_yc += s["yes_correct"]
-        total_yt += s["yes_total"]
-        total_nc += s["no_correct"]
-        total_nt += s["no_total"]
-    out.append("  " + "-" * 70)
-    overall = (total_c / total_t) if total_t else 0.0
-    out.append(f"  {'OVERALL':<18s}{'':>4s}{total_c:>9d}{total_t:>7d}{overall:>8.3f}"
-               f"  {f'{total_yc}/{total_yt}':>12s}{f'{total_nc}/{total_nt}':>12s}")
+        s = stats.get(q.id, {})
+        correct = s.get("correct", 0); total = s.get("total", 0)
+        acc = (correct / total) if total else 0.0
+        per_q_acc.append(acc)
+        src = "S" if isinstance(q, BoolQuestion) and q.source == "signal" else "M"
+        kind = "choice" if isinstance(q, ChoiceQuestion) else "bool"
+
+        if isinstance(q, ChoiceQuestion):
+            parts = []
+            for opt in q.options:
+                tot = s.get("per_option_totals", {}).get(opt, 0)
+                hits = sum(s.get("per_option_hits", {}).get(opt, []))
+                parts.append(f"{opt}={hits}/{tot}")
+            breakdown = "  ".join(parts)
+        else:
+            yes_hits = sum(s.get("per_option_hits", {}).get("Yes", []))
+            no_hits = sum(s.get("per_option_hits", {}).get("No", []))
+            yes_total = s.get("per_option_totals", {}).get("Yes", 0)
+            no_total = s.get("per_option_totals", {}).get("No", 0)
+            breakdown = f"yes_caught={yes_hits}/{yes_total}  no_correct={no_hits}/{no_total}"
+
+        out.append(f"  {q.id:<20s}{src:>4s}{kind:>8s}{correct:>9d}{total:>7d}{acc:>8.3f}  {breakdown}")
+    out.append("  " + "-" * 86)
+    overall = (sum(per_q_acc) / len(per_q_acc)) if per_q_acc else 0.0
+    out.append(f"  {'OVERALL (mean)':<20s}{'':>4s}{'':>8s}{'':>9s}"
+               f"{'':>7s}{overall:>8.3f}")
     return "\n".join(out)
 
 
-def _format_variant_compare(stats: dict[str, dict]) -> str:
-    """Variant compare section is a no-op after the tuning pass folds the
-    winners back into STARTER_BOOL_QUESTIONS. Kept as a stub so the eval
-    output layout stays stable across tuning re-runs."""
-    return "originals vs variants — n/a (tuning pass complete)"
-
-
-def _format_misses(clip_results, manifest_by_label, questions, threshold) -> str:
-    out = ["misses (clip, question, expected, P(Yes), source)"]
+def _format_misses(clip_results, manifest_by_label, questions) -> str:
+    out = ["misses (clip, question, expected, predicted, P(Yes)/P(top), source)"]
     n = 0
     for label, scores in clip_results:
         m = manifest_by_label.get(label)
         if m is None:
             continue
         for q in questions:
-            col = q["manifest_col"]
-            expected = m.get(col, "")
-            if expected not in ("Yes", "No"):
+            col = q.manifest_col
+            expected = m.get(col or "", "")
+            if not expected:
                 continue
-            res = scores.get(q["id"])
+            res = scores.get(q.id)
             if res is None:
                 continue
-            predicted = res["answer"]
+            predicted = _predicted_from_result(res)
+            if predicted is None:
+                continue
             if predicted != expected:
                 n += 1
-                out.append(f"  {label:<22s}{q['id']:<14s}expected={expected:<4s}"
-                           f"got={predicted:<4s}{res['prob']:.3f}  src={res['source']}")
+                p = _result_p(res)
+                out.append(f"  {label:<22s}{q.id:<16s}expected={expected:<8s}"
+                           f"got={predicted:<8s}{p:.3f}  src={_result_source(res)}")
     if n == 0:
-        return "misses (clip, question, expected, P(Yes), source)\n  (none)"
+        return "misses (clip, question, expected, predicted, P(Yes)/P(top), source)\n  (none)"
     out.insert(1, f"  {n} miss(es)")
     return "\n".join(out)
 
@@ -181,13 +237,15 @@ def _format_misses(clip_results, manifest_by_label, questions, threshold) -> str
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
-                        help=f"P(Yes) >= threshold counts as 'Yes' (default {DEFAULT_THRESHOLD})")
+                        help=argparse.SUPPRESS)  # legacy; per-question `enter` thresholds in YAML are used
     parser.add_argument("--clips", nargs="*", default=None,
                         help="Run only these clip labels (default: every label in manifest)")
     parser.add_argument("--questions", nargs="*", default=None,
-                        help="Run only these question IDs (default: every starter question)")
+                        help="Run only these question IDs (default: every question in questions.yaml)")
     parser.add_argument("--quiet", action="store_true",
                         help="don't print per-clip progress")
+    parser.add_argument("--questions-path", default=None,
+                        help="path to questions.yaml (default: repo root)")
     args = parser.parse_args(argv)
 
     manifest = load_manifest()
@@ -201,18 +259,25 @@ def main(argv: list[str] | None = None) -> int:
         wanted = set(args.clips)
         labels = [l for l in labels if l in wanted]
 
-    questions = list(STARTER_BOOL_QUESTIONS)
+    if args.questions_path:
+        from earshot.schema import load_questions
+        questions = load_questions(args.questions_path)
+    else:
+        questions = load_default_questions()
     if args.questions:
         wanted_q = set(args.questions)
-        questions = [q for q in questions if q["id"] in wanted_q]
+        questions = [q for q in questions if q.id in wanted_q]
     if not questions:
         sys.stdout.write("no questions selected\n")
         return 1
 
     n_clips = len(labels)
     n_q = len(questions)
+    bool_count = sum(1 for q in questions if isinstance(q, BoolQuestion))
+    choice_count = sum(1 for q in questions if isinstance(q, ChoiceQuestion))
     sys.stdout.write(
-        f"running {n_clips} clip(s) × {n_q} question(s); threshold = {args.threshold}\n"
+        f"running {n_clips} clip(s) × {n_q} question(s) "
+        f"({bool_count} bool + {choice_count} choice); per-question enter thresholds from YAML\n"
         f"signal_silent: rms < {SIGNAL_SILENT_RMS_THRESHOLD:.5f} → Yes\n"
         f"  picked from manifest data between the loudest 'silent' clip and "
         f"the quietest 'non-silent' clip\n\n"
@@ -250,10 +315,7 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout.write(_format_accuracy(stats, questions))
     sys.stdout.write("\n\n")
 
-    sys.stdout.write(_format_variant_compare(stats))
-    sys.stdout.write("\n\n")
-
-    sys.stdout.write(_format_misses(clip_results, manifest_by_label, questions, args.threshold))
+    sys.stdout.write(_format_misses(clip_results, manifest_by_label, questions))
     sys.stdout.write("\n\n")
 
     if clip_results:
