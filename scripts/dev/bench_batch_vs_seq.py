@@ -20,7 +20,8 @@ import soundfile as sf
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from earshot.prompts import STARTER_BOOL_QUESTIONS  # noqa: E402
+from earshot.prompts import load_default_questions  # noqa: E402
+from earshot.schema import BoolQuestion  # noqa: E402
 from earshot.scorer import score_batched, score_sequential  # noqa: E402
 
 CLIPS_DIR = REPO_ROOT / "clips"
@@ -50,7 +51,8 @@ def main() -> int:
     label = CLIP_LABEL
     audio = load_audio(CLIPS_DIR / f"{label}.wav")
 
-    model_qs = [q for q in STARTER_BOOL_QUESTIONS if q.get("source", "model") == "model"]
+    model_qs = [q for q in load_default_questions()
+                if isinstance(q, BoolQuestion) and q.source == "model"]
     print(f"clip={label},  {len(model_qs)} model questions available", flush=True)
 
     # Warm-up: run both sequential and batched a couple of times so the
@@ -83,6 +85,26 @@ def main() -> int:
     print("-" * 50)
     for N, s, b, sp in rows:
         print(f"{N:>4d}  {s:>16.3f}  {b:>13.3f}  {sp:>9.2f}x")
+
+    # Also emit a machine-readable summary so the blog post and results/
+    # can quote numbers without re-running. Writes into results/ so the
+    # curated copy is in the same commit as the run.
+    csv_path = REPO_ROOT / "results" / "bench_stage3.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["n_questions", "sequential_s_median", "batched_s_median",
+                    "speedup_x", "clip_label", "clip_seconds",
+                    "warmup_passes", "timed_passes_per_n",
+                    "device", "backend", "precision", "attn"])
+        clip_seconds = sf.info(str(CLIPS_DIR / f"{label}.wav")).duration
+        for N, s, b, sp in rows:
+            w.writerow([N, f"{s:.3f}", f"{b:.3f}", f"{sp:.3f}",
+                        label, f"{clip_seconds:.2f}", WARMUP_N, 5,
+                        "Apple M4 MacBook Air 16 GB",
+                        "PyTorch MPS, eager",
+                        "fp16", "eager"])
+    print(f"\ncsv: {csv_path}")
     return 0
 
 
