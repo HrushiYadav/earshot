@@ -110,9 +110,11 @@ Question = Annotated[
 
 class BoolResult(BaseModel):
     """Typed output for a bool question. `p` is P(Yes); `fired` is whether
-    p crossed the question's `enter` threshold."""
+    p crossed the question's `enter` threshold. `source` is "model" for a
+    model-derived result, "signal" for a signal-derived one (e.g. silent)."""
     p: float = Field(ge=0.0, le=1.0)
     fired: bool
+    source: str = "model"
 
 
 class ChoiceResult(BaseModel):
@@ -120,6 +122,7 @@ class ChoiceResult(BaseModel):
     (sums to 1.0 within float epsilon); `top` is the highest-probability option."""
     probs: dict[str, float]
     top: str
+    source: str = "model"
 
     @model_validator(mode="after")
     def _check_top_is_in_probs(self) -> "ChoiceResult":
