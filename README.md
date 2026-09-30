@@ -1,137 +1,122 @@
 # earshot
 
-A shared-prefix audio decision engine for live microphone input on Apple Silicon.
+Ask many yes/no questions about the last 3 seconds of audio, answered in one batch, fully local on a MacBook Air.
 
-![Earshot live demo — 7 s slice from a real recording](results/demo.gif)
+![earshot reacting live to a real recording](results/demo.gif)
 
-The last 3 seconds of microphone audio is encoded once into a prefix state; many yes/no and multiple-choice questions are then answered in one batch that forks from it, with no text generation. Two tiers: signal checks computed straight from the audio (silence), and Qwen2.5-Omni-3B for everything else, at about TODO(Hz) on an Apple M4 MacBook Air (16 GB).
+earshot encodes the last 3 seconds of microphone audio once, then answers many yes/no and multiple-choice questions against that same state in a single batch. It reads each answer as the model's probability of "Yes" instead of generating text. Silence is detected straight from the audio level; everything else comes from Qwen2.5-Omni-3B.
 
-Read the write-up at **[hrushiyadav.com/blog/earshot](https://hrushiyadav.com/blog/earshot)** — every measurement, including the bug where the model silently ignored the audio.
+On a fanless M4 MacBook Air (16 GB), 11 questions take about 1.5 s per pass, and 32 questions take 2.7 s instead of 22 s when asked one at a time.
 
-## Why not just ask an audio model?
+Write-up with every measurement and bug: [hrushiyadav.com/blog/earshot](https://hrushiyadav.com/blog/earshot)
 
-| | **Normal: ask an audio model** | **earshot** |
-|---|---|---|
-| Audio processing | re-encodes the same 3 s window once per question | encodes once, reuses for all questions |
-| Time for 8 questions | 7.75 s | 1.64 s |
-| Output | free-form text you have to parse | typed probabilities, never a string to parse |
-| Format errors | yes — model can answer in any shape | none — output is `{p, fired}` or `{probs, top}` |
-| Confidence | you have to guess from the text | directly calibrated, P(Yes) ∈ [0, 1] |
-| Where it runs | cloud or a beefy GPU | fanless MacBook Air, fully offline |
+## What this is, and what it isn't
 
-(Times measured on `clips/calm_1.wav`, 5 s clip, 8 model questions, after 3 warm-up passes. Stage 3 bench — see [Verify](#verify) below.)
+- **The idea isn't new.** Prefix caching is standard in LLM serving, reading the probability of "Yes" is a known classification trick, and [Vertix](https://github.com/drxddy/vertix) did this for vision. earshot applies it to audio, locally, with a test that proves the batched answers are exact.
+- **It's not a trained decision model** like TypeSafe's [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev). It runs on an off-the-shelf model, and its probabilities are **not calibrated**: 0.8 means the model leans towards "Yes", not that it's right 80% of the time.
+- **It's not a voice model.** It doesn't transcribe or speak. It's a small decision layer that could sit next to one.
+- **It's tested on 21 short clips I recorded.** Treat the accuracy numbers as "it works", not as a benchmark.
+
+## Why batch the questions?
+
+| | One question at a time | earshot |
+| --- | --- | --- |
+| Audio processing | Repeated for every question | Once per window, shared by all questions |
+| 32 questions (3 s window) | 22.5 s | 2.7 s |
+| Output | Free text to parse | A probability per question |
+| Format errors | Possible | Not possible: only the Yes/No (or option) scores are read |
 
 ## Setup
 
 ```bash
-# Python 3.11, Apple Silicon recommended
+# Python 3.11, Apple Silicon
 uv sync
 ```
 
-The model weights download on first run (`Qwen/Qwen2.5-Omni-3B`, ~6 GB). Subsequent runs use the local cache.
+The first run downloads Qwen/Qwen2.5-Omni-3B (~12 GB of files). Only the "thinker" part is loaded, about 4 GB in memory. Quit other memory-heavy apps (e.g. Docker) for best speed on a 16 GB machine.
 
 ## Run
 
 ```bash
-# Stage 5 — live microphone loop (coming)
-# uv run python -m earshot.live --questions questions.yaml --hop 0.5
+# live microphone
+uv run python -m earshot.live --hop 1.0
 
-# Stage 5 — replay a clip, no live UI (coming)
-# uv run python -m earshot.live --source clips/calm_1.wav --no-view --log run.jsonl
+# replay an audio file instead of the mic, headless, with a log
+uv run python -m earshot.live --source path/to/clip.wav --no-view --log run.jsonl
 
-# Stage 5 — ad-hoc extra question on top of the YAML set (coming)
-# uv run python -m earshot.live --ask "Is someone waving?"
-
-# Current: evaluate the YAML questions against the manifest (Stage 4)
-uv run python scripts/eval_clips.py
+# add your own question on top of questions.yaml
+uv run python -m earshot.live --ask "Is someone whistling?"
 ```
+
+Questions, types and thresholds live in `questions.yaml`. On macOS, allow your terminal to use the microphone (System Settings → Privacy & Security → Microphone).
 
 ## Verify
 
-The equivalence test (Stage 3) checks that the batched fork produces the
-same answers as the sequential one-question-per-forward baseline, within
-0.02 in P(Yes). It also covers choice questions (Stage 4) via L1
-distance across the probs dict.
-
 ```bash
-# Normal run — must PASS
+# batched answers match asking one question at a time (fp16, tolerance 0.01)
 uv run python tests/test_equivalence.py
 
-# Control mode — deliberately offsets suffix positions by +1; must FAIL
-# (exit 0 only if at least one cell breaks, proving the test is sensitive)
+# control: deliberately wrong token positions; this MUST fail
 uv run python tests/test_equivalence.py --wrong-pos
 
-# Schema + bad-YAML checks (Stage 4) — all 8 must PASS
+# question-file validation
 uv run python tests/test_schema.py
 
-# Per-clip evaluation against the manifest (Stage 4)
+# accuracy on the labelled clips
 uv run python scripts/eval_clips.py
-
-# Stage 3 quick bench — sequential vs batched on one clip (N in 1, 4, 8)
-uv run python scripts/dev/bench_batch_vs_seq.py
 ```
 
-Acceptance so far:
+The evaluation and equivalence scripts need your own labelled clips in `clips/` (not included). `scripts/record_session.py` walks you through recording them.
+
+## Results
 
 | Check | Result |
-|---|---|
-| `tests/test_equivalence.py` (21 clips × 13 model questions, tolerance 0.02) | max diff 0.000000; speedup ×4.84 |
-| `tests/test_equivalence.py --wrong-pos` | breaks equivalence on TODO(most) cells — control is working |
-| `tests/test_schema.py` (8 tests) | TODO(pass count) |
-| `scripts/eval_clips.py` overall accuracy at threshold 0.5 | TODO |
-| Stage 3 bench (calm_1, after 3 warm-ups + 5 timed passes) | N=1: 0.755 s → 0.912 s; N=4: 3.101 s → 1.099 s; N=8: 7.751 s → 1.637 s |
+| --- | --- |
+| Batched vs one-at-a-time, max difference | 0.0074 (fp16 rounding noise) |
+| Same test with wrong positions (control) | 0.0935, fails as it should |
+| "Yes" cases caught on 21 clips | 24 / 25 |
+| Main-sound choice (speech / music / noise / silence) | 15 / 21 |
+| Live rate, 11 questions | 0.67 passes/s, median 1.48 s |
+
+| Questions | One at a time | Batched | Speedup |
+| --- | --- | --- | --- |
+| 1 | 0.56 s | 0.81 s | 0.69× |
+| 4 | 2.71 s | 1.03 s | 2.6× |
+| 8 | 5.50 s | 1.36 s | 4.0× |
+| 16 | 11.15 s | 1.94 s | 5.8× |
+| 32 | 22.46 s | 2.72 s | 8.3× |
+
+*M4 MacBook Air 16 GB, fp16, 3 s window, 2 minute warm-up, median of 20 passes (10 for 32 questions).*
+
+![Batched vs one-at-a-time latency](results/latency.png)
+
+Full reports: [`results/bench.md`](results/bench.md), [`results/eval_clips.md`](results/eval_clips.md).
+
+## Limitations
+
+- **Not calibrated.** "Angry" reacts to what the words mean, not how they're said: "Please stop making that noise" scores 0.88 angry when said normally.
+- **Singing counts as speaking.**
+- **Typing can look like clapping.**
+- **About 1.5 s per pass** on a fanless Air, and the model hears a 3 s window, so reactions lag by roughly 2–3 s.
+- **One model.** The prefix/suffix split and the Yes/No token ids are specific to Qwen2.5-Omni-3B.
 
 ## Layout
 
 | Path | Role |
-|---|---|
-| `README.md` | this file |
-| `AGENTS.md` | per-stage notes, model recipe, measured numbers (gitignored) |
-| `questions.yaml` | production question set — 12 bool + 2 choice, loaded via pydantic schema |
-| `pyproject.toml` | project + dependencies |
-| `src/earshot/audio.py` | mic capture + ring buffer |
-| `src/earshot/model.py` | load Qwen2.5-Omni-3B (thinker-only) on MPS |
-| `src/earshot/scorer.py` | sequential + batched fork-and-score; bool P(Yes) + choice letter-token softmax |
-| `src/earshot/schema.py` | pydantic models for `BoolQuestion`, `ChoiceQuestion`, results, YAML loader |
-| `src/earshot/prompts.py` | system message, question template, signal thresholds; re-exports YAML loader |
-| `scripts/eval_clips.py` | per-clip eval against `clips/manifest.csv` |
-| `scripts/spike_models.py` | Stage 0 model-load probe |
-| `scripts/record_clips.py`, `scripts/record_session.py` | Stage 1 — labelled clip recording |
-| `scripts/dev/bench_batch_vs_seq.py` | Stage 3 quick timing |
-| `tests/test_equivalence.py` | Stage 3 — sequential vs batched |
-| `tests/test_schema.py` | Stage 4 — YAML schema + bad-YAML checks |
-| `clips/` | user recordings (gitignored) |
-| `private/` | plan, notes, references, debug scripts (gitignored) |
-| `results/` | small committed reports — markdown, csv, png only |
-
-## Results
-
-TODO(table) — per-question accuracy, no-decode vs decode, batched
-latency by N, ECE after Stage 7 calibration. See `results/` for the
-charts.
-
-## Limitations
-
-- **Singing is counted as speech.** `is_speaking` P(Yes) is high on sung
-  lyrics; we don't separate the two.
-- **`angry` reacts to word meaning, not vocal stress.** The model uses
-  lexical cues ("stop") as much as acoustic ones (loudness, pitch);
-  Stage 7 calibration is needed to make it useful.
-- **~1 Hz on a fanless Air.** With 9 model questions (Stage 4 production
-  set) and the batched path, throughput is roughly one decision per
-  second. Above that the model latency dominates; below that the audio
-  ring buffer is the bottleneck.
-- **Qwen2.5-Omni-3B is the only supported model.** The fork trick depends
-  on the prefix/suffix split that the chat template renders around the
-  `<|AUDIO|>` placeholder. A different audio LM would need its own
-  prefix split and token-id groups for the Yes/No read-out.
+| --- | --- |
+| `src/earshot/audio.py` | Mic capture and 3 s ring buffer |
+| `src/earshot/model.py` | Loads the Qwen2.5-Omni-3B thinker on Apple GPU (fp16) |
+| `src/earshot/scorer.py` | One-at-a-time and batched scoring, Yes/No and multiple-choice readout |
+| `src/earshot/schema.py` | Question file validation and typed results |
+| `src/earshot/prompts.py` | System message and question template |
+| `src/earshot/live.py` | Live loop, dashboard, file replay, `--ask`, JSONL log |
+| `questions.yaml` | Default questions |
+| `scripts/` | Clip recording, evaluation, benchmark, demo track |
+| `tests/` | Equivalence (with wrong-position control), schema, live smoke test |
+| `results/` | Benchmark and evaluation reports, chart, demo GIF |
 
 ## Credits
 
-Architectural reference: [drxddy/vertix](https://github.com/drxddy/vertix) —
-shared-prefix VLM decision engine on Apple Silicon (tiers, --wrong-pos
-control, MLX runtime, early-exit per-layer states). Read-only
-inspiration; no code copied.
-
-Jev-style typed tool calls: [TypeSafe — Introducing System One Models
-and Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev).
+- [Vertix](https://github.com/drxddy/vertix) by Dhikshith Reddy: the shared-prefix decision engine for vision that this project follows. Ideas only; no code copied.
+- [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) by TypeSafe: for the idea of typed decisions with probabilities instead of text.
+- [Qwen2.5-Omni](https://huggingface.co/Qwen/Qwen2.5-Omni-3B) by the Qwen team: the model doing the listening.
