@@ -2,6 +2,8 @@
 
 A shared-prefix audio decision engine for live microphone input on Apple Silicon.
 
+![Earshot live demo — 7 s slice from a real recording](results/demo.gif)
+
 The last 3 seconds of microphone audio is encoded once into a prefix state; many yes/no and multiple-choice questions are then answered in one batch that forks from it, with no text generation. Two tiers: signal checks computed straight from the audio (silence), and Qwen2.5-Omni-3B for everything else, at about TODO(Hz) on an Apple M4 MacBook Air (16 GB).
 
 Read the write-up at **[hrushiyadav.com/blog/earshot](https://hrushiyadav.com/blog/earshot)** — every measurement, including the bug where the model silently ignored the audio.
