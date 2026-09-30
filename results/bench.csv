@@ -1,0 +1,11 @@
+"# Stage 6 bench — earshot, M4 MacBook Air 16 GB, fp16"
+#,"clip=calm_1.wav, window=3.00s, warmup=120s"
+n_questions,sequential_s_median,sequential_s_p90,sequential_s_mean,sequential_s_min,sequential_passes,batched_s_median,batched_s_p90,batched_s_mean,batched_s_min,batched_passes,speedup_median,peak_mb
+1,0.5570,0.5971,0.5723,0.4632,20,0.8130,0.8685,0.8080,0.6616,20,0.685,5950.2
+4,2.7102,2.8106,2.7288,2.6246,20,1.0276,1.1269,1.0418,0.9294,20,2.638,5950.2
+8,5.4957,5.6147,5.5020,5.2884,20,1.3585,1.4507,1.3631,1.1936,20,4.046,5950.2
+16,11.1471,11.4590,11.2024,10.8502,20,1.9347,2.2709,2.1241,1.8325,20,5.762,5950.2
+
+# live rate (earshot.live --no-view --source calm_1.wav for 60s)
+passes,wall_elapsed_s,loop_elapsed_s,passes_per_s,median_latency_s,p90_latency_s
+40,136.96,59.43,0.673,1.4821,1.5279
