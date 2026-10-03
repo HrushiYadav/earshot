@@ -41,3 +41,5 @@ hf_cache/
 # Editor / IDE
 .vscode/
 .idea/
+data/
+data/esc50/
