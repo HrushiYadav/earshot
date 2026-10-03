@@ -97,7 +97,7 @@ Full reports: [`results/bench.md`](results/bench.md), [`results/eval_clips.md`](
 
 Three ways to answer questions about a short audio clip — a text-prompted audio model (CLAP), a tiny classifier trained on top of AST features, and earshot. They answer different questions well. Full report: [`results/v02_comparison.md`](results/v02_comparison.md).
 
-![v0.2 comparison chart](results/v02_comparison.png)
+![Comparison chart: earshot vs CLAP vs a trained classifier](results/v02_comparison.png)
 
 ### ESC-50 fold 1 (50 fine-grained sound classes)
 
