@@ -15,6 +15,7 @@ Write-up with every measurement and bug: [hrushiyadav.com/blog/earshot](https://
 - **The idea isn't new.** Prefix caching is standard in LLM serving, reading the probability of "Yes" is a known classification trick, and [Vertix](https://github.com/drxddy/vertix) did this for vision. earshot applies it to audio, locally, with a test that proves the batched answers are exact.
 - **It's not a trained decision model** like TypeSafe's [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev). It runs on an off-the-shelf model, and its probabilities are **not calibrated**: 0.8 means the model leans towards "Yes", not that it's right 80% of the time.
 - **It's not a voice model.** It doesn't transcribe or speak. It's a small decision layer that could sit next to one.
+- **For fixed sound labels, dedicated classifiers are faster and more accurate** (see [Earshot vs CLAP vs a trained classifier](#earshot-vs-clap-vs-a-trained-classifier) below). earshot is the right choice when the question is about *what was said* or *how it was said*.
 - **It's tested on 21 short clips I recorded.** Treat the accuracy numbers as "it works", not as a benchmark.
 
 ## Why batch the questions?
@@ -33,7 +34,7 @@ Write-up with every measurement and bug: [hrushiyadav.com/blog/earshot](https://
 uv sync
 ```
 
-The first run downloads Qwen/Qwen2.5-Omni-3B (~12 GB of files). Only the "thinker" part is loaded, about 4 GB in memory. Quit other memory-heavy apps (e.g. Docker) for best speed on a 16 GB machine.
+The first run downloads Qwen/Qwen2.5-Omni-3B (~12 GB of files). Only the "thinker" part is loaded — ~4 GB of weights, ~9–10 GB peak **MPS driver-allocated memory** during a forward pass (KV cache + activations on top of the weights). Quit other memory-heavy apps (e.g. Docker) for best speed on a 16 GB machine.
 
 ## Run
 
@@ -91,6 +92,39 @@ The evaluation and equivalence scripts need your own labelled clips in `clips/` 
 ![Batched vs one-at-a-time latency](results/latency.png)
 
 Full reports: [`results/bench.md`](results/bench.md), [`results/eval_clips.md`](results/eval_clips.md).
+
+## Earshot vs CLAP vs a trained classifier
+
+Three ways to answer questions about a short audio clip — a text-prompted audio model (CLAP), a tiny classifier trained on top of AST features, and earshot. They answer different questions well. Full report: [`results/v02_comparison.md`](results/v02_comparison.md).
+
+![v0.2 comparison chart](results/v02_comparison.png)
+
+### ESC-50 fold 1 (50 fine-grained sound classes)
+
+| method | top-1 | median / clip | peak MPS |
+|---|---|---|---|
+| **AST + LR** (trained on folds 2–5) | **0.905** | 129 ms *(batch-of-8)* | 1.20 GB |
+| **CLAP** zero-shot, readable phrases | 0.883 | 26 ms | 1.05 GB |
+| **CLAP** zero-shot, raw snake_case labels | 0.838 | 25 ms | 1.05 GB |
+| **earshot** (50 bool questions, batched), calibrated | **0.850** | 4.3 s | 10.3 GB |
+| **earshot**, raw P(Yes) argmax | 0.823 | 4.3 s | 10.3 GB |
+
+For a fixed label set, a tiny classifier on AST embeddings wins on accuracy and latency. CLAP is faster and lighter than earshot but only beats earshot if its prompts are written as readable English phrases rather than raw `snake_case` labels — that gap is 4.5 percentage points.
+
+### Binary contextual / paralinguistic tasks
+
+AUROC is threshold-free, so it doesn't suffer from the always-pick-one baseline that "stop vs other" or "?" vs "." does.
+
+| task | n | baseline | **earshot** acc / AUROC | **CLAP** acc (3 prompts) / AUROC (3 prompts) |
+|---|---:|---:|---:|---:|
+| RAVDESS calm vs angry (CC BY-NC-SA 4.0) | 384 | 0.500 | **0.945 / 0.993** | 0.398–0.628 / 0.367–0.816 |
+| RAVDESS speech vs song (CC BY-NC-SA 4.0) | 384 | 0.500 | **0.682 / 0.926** | 0.510–0.591 / 0.617–0.740 |
+| Speech Commands stop vs other (CC BY 4.0) | 500 | 0.500 | **0.982 / 0.999** | 0.430–0.500 / 0.363–0.587 |
+| macOS `say` q vs statement (SYNTHETIC, n=20) | 20 | 0.500 | **0.700 / 0.810** | 0.500–0.500 / 0.250–0.300 |
+
+For questions about *what was said* or *how it was said* — acted emotion, the word "stop", statement vs question — earshot separates the classes far better (AUROC 0.93–0.999 vs ≤0.82 for CLAP's best prompt). CLAP matches sounds to descriptions; it wasn't trained to understand speech.
+
+Caveats: training-overlap with CLAP/AST/Qwen3 pre-training data; RAVDESS is acted emotion on two neutral sentences; Speech Commands is single-word keyword spotting; `say` is synthetic; one machine; 0.5 threshold not tuned for prevalence.
 
 ## Limitations
 
