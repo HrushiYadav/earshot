@@ -8,12 +8,12 @@ earshot encodes the last 3 seconds of microphone audio once, then answers many y
 
 On a fanless M4 MacBook Air (16 GB), 11 questions take about 1.5 s per pass, and 32 questions take 2.7 s instead of 22 s when asked one at a time.
 
-Write-up with every measurement and bug: [hrushiyadav.com/blog/earshot](https://hrushiyadav.com/blog/earshot)
+Write-up with every measurement and bug: [hrushiyadav.com/blog/earshot](https://hrushiyadav.com/blog/earshot).
 
 ## What this is, and what it isn't
 
 - **The idea isn't new.** Prefix caching is standard in LLM serving, reading the probability of "Yes" is a known classification trick, and [Vertix](https://github.com/drxddy/vertix) did this for vision. earshot applies it to audio, locally, with a test that proves the batched answers are exact.
-- **It's not a trained decision model** like TypeSafe's [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev). It runs on an off-the-shelf model, and its probabilities are **not calibrated**: 0.8 means the model leans towards "Yes", not that it's right 80% of the time.
+- **It's not a trained decision model** like TypeSafe's [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev). It runs on an off-the-shelf model; its probabilities are *not* calibrated probabilities — 0.8 means the model leans towards "Yes", not that it's right 80% of the time. ([Calibration](results/v02_comparison.md) helps on a 50-way task but does not make individual probabilities trustworthy.)
 - **It's not a voice model.** It doesn't transcribe or speak. It's a small decision layer that could sit next to one.
 - **For fixed sound labels, dedicated classifiers are faster and more accurate** (see [Earshot vs CLAP vs a trained classifier](#earshot-vs-clap-vs-a-trained-classifier) below). earshot is the right choice when the question is about *what was said* or *how it was said*.
 - **It's tested on 21 short clips I recorded.** Treat the accuracy numbers as "it works", not as a benchmark.
@@ -124,14 +124,14 @@ AUROC is threshold-free, so it doesn't suffer from the always-pick-one baseline 
 
 For questions about *what was said* or *how it was said* — acted emotion, the word "stop", statement vs question — earshot separates the classes far better (AUROC 0.93–0.999 vs ≤0.82 for CLAP's best prompt). CLAP matches sounds to descriptions; it wasn't trained to understand speech.
 
-Caveats: training-overlap with CLAP/AST/Qwen3 pre-training data; RAVDESS is acted emotion on two neutral sentences; Speech Commands is single-word keyword spotting; `say` is synthetic; one machine; 0.5 threshold not tuned for prevalence.
+Caveats: training-overlap with CLAP / AST / Qwen2.5-Omni pre-training data; RAVDESS is acted emotion on two neutral sentences; Speech Commands is single-word keyword spotting; `say` is synthetic; one machine; 0.5 threshold not tuned for prevalence.
 
 ## Limitations
 
-- **Not calibrated.** "Angry" reacts to what the words mean, not how they're said: "Please stop making that noise" scores 0.88 angry when said normally.
-- **Singing counts as speaking.**
-- **Typing can look like clapping.**
-- **About 1.5 s per pass** on a fanless Air, and the model hears a 3 s window, so reactions lag by roughly 2–3 s.
+- **Probabilities aren't calibrated out of the box.** A per-question contextual bias (computed from neutral inputs) improves top-1 accuracy on a 50-way task, but P(Yes) values are not trustworthy as probabilities. See [`results/v02_comparison.md`](results/v02_comparison.md).
+- **Singing counts as speaking.** A clearly sung clip still scores "Yes" on `is_speaking`.
+- **Typing can look like clapping.** Short, regular bursts sound similar to `is_speaking=false`+`clapping=true`.
+- **About 1.5 s per pass** on a fanless Air, and the model hears a 3 s window, so reactions lag by roughly 2–3 s end-to-end.
 - **One model.** The prefix/suffix split and the Yes/No token ids are specific to Qwen2.5-Omni-3B.
 
 ## Layout
@@ -139,15 +139,15 @@ Caveats: training-overlap with CLAP/AST/Qwen3 pre-training data; RAVDESS is acte
 | Path | Role |
 | --- | --- |
 | `src/earshot/audio.py` | Mic capture and 3 s ring buffer |
-| `src/earshot/model.py` | Loads the Qwen2.5-Omni-3B thinker on Apple GPU (fp16) |
+| `src/earshot/model.py` | Loads the Qwen2.5-Omni-3B thinker on MPS (fp16) |
 | `src/earshot/scorer.py` | One-at-a-time and batched scoring, Yes/No and multiple-choice readout |
 | `src/earshot/schema.py` | Question file validation and typed results |
 | `src/earshot/prompts.py` | System message and question template |
 | `src/earshot/live.py` | Live loop, dashboard, file replay, `--ask`, JSONL log |
-| `questions.yaml` | Default questions |
-| `scripts/` | Clip recording, evaluation, benchmark, demo track |
+| `questions.yaml` | Default questions (10 bool + 1 choice) |
+| `scripts/` | Recording, evaluation, benchmark, demo track, and the earshot-vs-CLAP-vs-classifier comparison |
 | `tests/` | Equivalence (with wrong-position control), schema, live smoke test |
-| `results/` | Benchmark and evaluation reports, chart, demo GIF |
+| `results/` | Curated benchmark and evaluation reports, chart, demo GIF, comparison report |
 
 ## Credits
 
