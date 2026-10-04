@@ -12,7 +12,7 @@ Write-up with every measurement and bug: [hrushiyadav.com/blog/earshot](https://
 
 ## What this is, and what it isn't
 
-- **The idea isn't new.** Prefix caching is standard in LLM serving, reading the probability of "Yes" is a known classification trick, and [Vertix](https://github.com/drxddy/vertix) did this for vision. earshot applies it to audio, locally, with a test that proves the batched answers are exact.
+- **The idea isn't new.** Prefix caching is standard in LLM serving, reading the probability of "Yes" is a known classification trick, and [Vertix](https://github.com/drxddy/vertix) did this for vision. earshot applies it to audio, locally, with a test showing the batched answers match one-at-a-time answers to within fp16 rounding (max difference 0.0074), plus a control that must fail (0.0935 with deliberately wrong positions).
 - **It's not a trained decision model** like TypeSafe's [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev). It runs on an off-the-shelf model; its probabilities are *not* calibrated probabilities — 0.8 means the model leans towards "Yes", not that it's right 80% of the time. ([Calibration](results/v02_comparison.md) helps on a 50-way task but does not make individual probabilities trustworthy.)
 - **It's not a voice model.** It doesn't transcribe or speak. It's a small decision layer that could sit next to one.
 - **For fixed sound labels, dedicated classifiers are faster and more accurate** (see [Earshot vs CLAP vs a trained classifier](#earshot-vs-clap-vs-a-trained-classifier) below). earshot is the right choice when the question is about *what was said* or *how it was said*.
