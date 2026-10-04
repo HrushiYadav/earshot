@@ -128,7 +128,8 @@ Caveats: training-overlap with CLAP / AST / Qwen2.5-Omni pre-training data; RAVD
 
 ## Limitations
 
-- **Probabilities aren't calibrated out of the box.** A per-question contextual bias (computed from neutral inputs) improves top-1 accuracy on a 50-way task, but P(Yes) values are not trustworthy as probabilities. See [`results/v02_comparison.md`](results/v02_comparison.md).
+- **"Angry" mixes tone and meaning.** On RAVDESS, where the words are identical and only the tone differs, it separates calm from angry almost perfectly (AUROC 0.993). But when the words themselves sound like a complaint, meaning can override tone: "Please stop making that noise" said calmly still scores 0.88.
+- **Not calibrated.** A P(Yes) of 0.8 means the model leans towards "Yes", not that it's right 80% of the time. Thresholds need tuning per question (e.g. speaking vs singing: AUROC 0.93, but only 37% of songs caught at 0.5).
 - **Singing counts as speaking.** A clearly sung clip still scores "Yes" on `is_speaking`.
 - **Typing can look like clapping.** Short, regular bursts sound similar to `is_speaking=false`+`clapping=true`.
 - **About 1.5 s per pass** on a fanless Air, and the model hears a 3 s window, so reactions lag by roughly 2–3 s end-to-end.
